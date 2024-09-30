@@ -1,0 +1,27 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CudaCompile Include="Network.cu">
+      <Filter>Network\Source</Filter>
+    </CudaCompile>
+    <CudaCompile Include="kernel.cu">
+      <Filter>Network\Source</Filter>
+    </CudaCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="Network">
+      <UniqueIdentifier>{57a52894-7514-4b46-aa19-5daf301f273a}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Network\Header">
+      <UniqueIdentifier>{342ff73f-059f-45e5-93b2-f0e3974b5318}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Network\Source">
+      <UniqueIdentifier>{eaf0e31b-104a-477c-b330-56370fbde431}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="Network.h">
+      <Filter>Network\Header</Filter>
+    </ClInclude>
+  </ItemGroup>
+</Project>
