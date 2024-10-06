@@ -405,270 +405,431 @@ __global__ void apply_gradients(int neuron_sum, int weight_sum, int layer, doubl
 
 }
 
+__global__ void feedforward_layer(const int batch_size, const int layer, const double momentum, const double leaky_relu, const int cumulative_neuron_sum, const int cumulative_neuron_sum_nol1, const int cumulative_weight_sum, const bool debug_flag) {
+	Network::h_debugger d_debug;
+
+	int epoch = blockIdx.y;
+	int neuron = blockIdx.x;
+	int batch = threadIdx.x;
+
+	//get proper indexes for everything
+	int output_offset = d_neurons_count * batch_size * epoch + (cumulative_neuron_sum + neuron) * batch_size + batch;
+	int x_offset = d_neurons_count_nol1 * batch_size * epoch + (cumulative_neuron_sum_nol1 + neuron) * batch_size + batch;
+	int mean_offset = d_neurons_count_nol1 * epoch + cumulative_neuron_sum_nol1 + neuron;
+
+	int bias_offset = cumulative_neuron_sum_nol1 + neuron;
+	int weight_offset = cumulative_weight_sum + neuron * d_layer_sizes[layer - 1];
+
+	//forward prior layer
+	for (int j = 0; j < d_layer_sizes[layer - 1]; j++) {
+		d_epochs_data->d_epoch_x[x_offset] += d_epochs_data->d_epoch_output[d_neurons_count * batch_size * epoch + (cumulative_neuron_sum - d_layer_sizes[layer - 1]) * batch_size + j * batch_size] * d_weights[weight_offset + j];
+	}
+	d_epochs_data->d_epoch_x[x_offset] += d_gradients->d_bias_gradient[bias_offset];
+
+	//get mean
+	atomicAdd(d_epochs_data->d_epoch_mean[mean_offset], d_epochs_data->d_epoch_x[x_offset] / batch_size);
+	
+	//add it to running mean
+	if (batch == 0) {
+		d_running_mean[bias_offset] = (d_running_mean[bias_offset] * momentum) + (d_epochs_data->d_epoch_mean[mean_offset] * (1 - momentum));
+	}
+
+	__syncthreads();
+
+	//get variance
+	atomicAdd(d_epochs_data->d_epoch_variance[mean_offset], (d_epochs_data->d_epoch_x[x_offset] - d_epochs_data->d_epoch_mean[mean_offset]) * (d_epochs_data->d_epoch_x[x_offset] - d_epochs_data->d_epoch_mean[mean_offset]) / batch_size);
+
+	//add it to running variance
+	if (batch == 0) {
+		d_running_variance[bias_offset] = (d_running_variance[bias_offset] * momentum) + (d_epochs_data->d_epoch_variance[mean_offset] * (1 - momentum));
+	}
+
+	__syncthreads();
+
+	//normalize
+	d_epochs_data->d_epoch_x_norm[x_offset] = (d_epochs_data->d_epoch_x[x_offset] - d_epochs_data->d_epoch_mean[mean_offset]) / d_epochs_data->d_epoch_variance[mean_offset];
+
+	//apply gamma + beta
+	d_epochs_data->d_epoch_y[x_offset] = d_epochs_data->d_epoch_x_norm[x_offset] * d_gamma[bias_offset] + d_beta[bias_offset];
+
+	//apply activation
+	d_epochs_data->d_epoch_output[output_offset] = (d_epochs_data->d_epoch_y[x_offset] > 0) ? d_epochs_data->d_epoch_y[x_offset] : d_epochs_data->d_epoch_y[x_offset] * leaky_relu;
+
+
+}
+
 int Network::train(const int batch_size, const int epochs, double eta, double momentum, double leaky_relu, bool debug_flag) {
-	auto stime_nano = std::chrono::high_resolution_clock::now();
-	if (debug_flag) {
-		printf("Debug~\tinitalizing with:\tLayer Sizes: ");
-		for (int i = 0; i < h_network_size; i++) printf("%d ", h_layer_sizes[i]);
-		printf("\tBatch Size: %d\t\tEpochs: %d\n", batch_size, epochs);
-	}
+	//set up host debugger
+	h_debugger h_debug;
+	h_debug.setup(debug_flag);
 
-	auto stime_temp = std::chrono::high_resolution_clock::now();
-	if (debug_flag) {
-		auto stime_temp = std::chrono::high_resolution_clock::now();
-		printf("Debug~\tcalculating free space...\n");
-	}
+	//calculate optimal simultaneous thread launching
+	h_debug.print_timer_start("calculating optimal configuration for launching threads...");
+		//calculate size of device memory for interface
+	size_t interface_mem = 0;
+	interface_mem += 4 * sizeof(int); //network size + sum of neurons, weights, and neurons - layer size 0
+	interface_mem += h_neurons_count * sizeof(double) + sizeof(double*); //d_neurons
+	interface_mem += h_neurons_count_nol1 * sizeof(double) * 5 + sizeof(double*) * 5; //d_bias, d_gamma, d_beta, d_running_mean, d_running_variance
+	interface_mem += h_weights_count * sizeof(double) + sizeof(double*); //d_weights
+	interface_mem += h_network_size * sizeof(int) + sizeof(int*);
 
-	//get available device memory
+		//calculate size of device memory shared across epochs
+	size_t shared_epoch_mem = 0;
+	shared_epoch_mem += sizeof(gradient_str*) + sizeof(gradient_str) + 
+		h_neurons_count_nol1 * sizeof(double) * 3 + //gamma, beta, bias
+		h_weights_count * sizeof(double); //weights
+
+		//calculate memory needed across one epoch
+	size_t epoch_specific_memory = 0;
+	epoch_specific_memory += sizeof(epoch_data_str*) + sizeof(epoch_data_str) + 
+		h_neurons_count * batch_size * sizeof(double) + //outputs
+		h_neurons_count_nol1 * sizeof(double) * 2 + //mean + variance
+		h_neurons_count_nol1 * batch_size * sizeof(double) * 4 + //x, xnorm, y, errors
+		(h_network_size - 1) * batch_size * sizeof(int) * 3 + sizeof(double*) + //local memory used inside feedforward function
+		(h_network_size - 1) * sizeof(double) * 2 + //shared memory inside feedforward function
+		(h_network_size - 1) * batch_size * sizeof(int) + (h_network_size - 1) * batch_size * sizeof(double) * 5 + //local memory inside backprop function
+		(h_network_size - 1) * sizeof(double) * 3 + //shared memory inside backprop function
+		h_neurons_count_nol1 * batch_size * sizeof(curandState);
+
+		//get available memory
 	size_t free_mem, total_mem;
-	cudaMemGetInfo(&free_mem, &total_mem);
-		//assume we can use ~50% of free memory
-	size_t usable_memory = free_mem * 0.5f;
-		//calculate minimum memory needed outside of epochs
-	size_t essential_mem = h_neurons_count * sizeof(double) * 3 + h_weights_count * sizeof(double); //gradients
-		//calculate memory needed per epoch
-	printf("~%d\t%d\t%d\t%d\t%d\t%d~\n", h_neurons_count, batch_size, sizeof(double), sizeof(curandState), h_weights_count, h_neurons_count_nol1);
-	size_t needed_mem_per_epoch = 0;
-	needed_mem_per_epoch += h_neurons_count * batch_size * sizeof(double) * 1; //outputs
-	needed_mem_per_epoch += h_neurons_count_nol1 * sizeof(double) * 2; //mean and variance
-	needed_mem_per_epoch += h_neurons_count_nol1 * batch_size * sizeof(double) * 4; //x, x_norm, y, neuron_err
-	needed_mem_per_epoch += h_layer_sizes[0] * batch_size * sizeof(curandState); //random number generator state
-	//get max amount of epochs
-	size_t max_epochs_sync = ((usable_memory - essential_mem) / needed_mem_per_epoch);
-	if (debug_flag) {
-		std::cout << "Debug~\tfinished calculating free space in " << std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - stime_temp).count() / 1000000000.0f << " seconds\n";
-		printf("\t\tTotal Space (bytes): %zu | Total Usable Space (bytes): %zu\n", total_mem, free_mem);
-		printf("\t\tMax memory able to be utilized by program (bytes): %zu\n", usable_memory);
-		printf("\t\tEssential Memory Needed (bytes): %zu | Memory Per Epoch Needed (bytes): %zu\n", essential_mem, needed_mem_per_epoch);
-		printf("\t\tMax Number of Epochs running synchronously: %lu\n", max_epochs_sync);
-	}
+	h_debug.print_if_cuda_error(cudaMemGetInfo(&free_mem, &total_mem), "getting device memory info returned error code: %ce");
 
-	//get largest layer size
-	int h_largest_layer = h_layer_sizes[1];
-	for (int i = 2; i < h_network_size; i++) if (h_layer_sizes[i] > h_largest_layer) h_largest_layer = h_layer_sizes[i];
-	//make sure we can run enough threads inside the training kernel
-	cudaDeviceSetLimit(cudaLimitDevRuntimePendingLaunchCount, h_largest_layer * 1024 * max_epochs_sync);
+		//just in case only use 80% of free memory
+	size_t usuable_mem = free_mem * 0.8;
 
-	//create stucture for gradients/value storage
-	if (debug_flag) {
-		stime_temp = std::chrono::high_resolution_clock::now();
-		printf("Debug~\tallocating necessary epoch memory on device...\n");
-	}
+		//calculate maximum number of epochs that can run simulanously
+	size_t max_epochs_simul = (usuable_mem - interface_mem - shared_epoch_mem) / epoch_specific_memory;
 
-	epoch_data_str* d_epochs_data_host;
-	epoch_data_str* h_epochs_data;
-	gradient_str* d_gradients_host;
+		//get predicted best configuration
+	int block_size_feedforward, min_grid_size_feedforward;
+	h_debug.print_if_cuda_error(cudaOccupancyMaxPotentialBlockSize(
+		&min_grid_size_feedforward,
+		&block_size_feedforward,
+		(void*)feedforward_layer,
+		(h_network_size - 1) * sizeof(double) * 2,
+		0
+	),
+		"getting optimal configuration for feedforward returned error code %ce");
+	int block_size_backprop, min_grid_size_backprop;
+	h_debug.print_if_cuda_error(cudaOccupancyMaxPotentialBlockSize(
+		&min_grid_size_backprop,
+		&block_size_backprop,
+		(void*)feedforward_layer,
+		(h_network_size - 1) * sizeof(double) * 2,
+		batch_size
+	),
+		"getting optimal configuration for feedforward returned error code %ce");
+	h_debug.print_timer_end("finished calculating optimal configuration for launching threads");
+	h_debug.print_general("Free Memory: %zu\tTotal Memory: %zu\tUsuable Memory:%zu\n\tInterface Memory: %zu\tShared Epoch Memory: %zu\tEpoch Specific Memory: %zu\n\tMax Epochs Running Simultaneously: %zu\n\tPredicted Optimal Feedforward Block Size: %d\tPredicted Optimal Feedforward Grid Size: %d\n\tPredicted Optimal Backprop Block Size: %d\tPredicted Optimal Backprop Grid Size: %d", 
+		free_mem, total_mem, usuable_mem, interface_mem, shared_epoch_mem, epoch_specific_memory, max_epochs_simul, block_size_feedforward, min_grid_size_feedforward, block_size_backprop, min_grid_size_backprop);
+
+	//set up gradients + data storage
+	h_debug.print_timer_start("setting up device memory for gradients and epoch data...");
+
+	epoch_data_str* h_epoch_data;
 	gradient_str* h_gradients;
 
-	cudaMalloc((void**)&d_epochs_data_host, sizeof(epoch_data_str));
-	cudaMalloc((void**)&d_gradients_host, sizeof(gradient_str));
-	h_epochs_data = (epoch_data_str*)malloc(sizeof(epoch_data_str));
+	h_epoch_data = (epoch_data_str*)malloc(sizeof(epoch_data_str));
 	h_gradients = (gradient_str*)malloc(sizeof(gradient_str));
 
+	h_epoch_data->allocate_memory(h_neurons_count * batch_size * min_grid_size_feedforward * sizeof(double),
+		h_neurons_count_nol1 * min_grid_size_feedforward * sizeof(double),
+		h_neurons_count_nol1 * batch_size * min_grid_size_feedforward * sizeof(double),
+		h_neurons_count_nol1 * batch_size * min_grid_size_feedforward * sizeof(curandState));
 	h_gradients->allocate_memory(h_neurons_count_nol1 * sizeof(double), h_weights_count * sizeof(double));
-	cudaMemcpy(d_gradients_host, h_gradients, sizeof(gradient_str), cudaMemcpyHostToDevice);
-	cudaMemcpyToSymbol(d_gradients, &d_gradients_host, sizeof(gradient_str*));
 
-	//calculate how many cycles we will need to run
-	size_t epoch_runs = epochs / max_epochs_sync;
-	size_t epoch_runs_debug = epoch_runs;
-	if (epoch_runs == 0) printf("\n\tWarning: Epoch value of %d is less then the amount of epochs that can run synchonously (%d)\n\n", epochs, max_epochs_sync);
-	if (epoch_runs != 0 && epoch_runs * max_epochs_sync != epochs) printf("\n\tWarning: Epoch value of %d is not a multiple of the amount of epochs that can run synchonously (%d)\n\n", epochs, max_epochs_sync);
+	epoch_data_str* d_epoch_data_host;
+	epoch_data_str* d_gradients_host;
+
+	h_debug.print_if_cuda_error(cudaMalloc((void**)&d_epoch_data_host, sizeof(epoch_data_str)), "allocating epoch data host pointer on device returned error code %ce");
+	h_debug.print_if_cuda_error(cudaMalloc((void**)&d_gradients_host, sizeof(gradient_str)), "allocating gradient host pointer on device returned error code %ce");
+
+	h_debug.print_if_cuda_error(cudaMemcpy(d_epoch_data_host, h_epoch_data, sizeof(epoch_data_str), cudaMemcpyHostToDevice), "copying epoch data host pointer on host to epoch data host pointer on device returned error code %ce");
+	h_debug.print_if_cuda_error(cudaMemcpy(d_gradients_host, h_gradients, sizeof(gradient_str), cudaMemcpyHostToDevice), "copying gradient host pointer on host to gradient host pointer on device returned error code %ce");
+
+	h_debug.print_if_cuda_error(cudaMemcpyToSymbol(d_epochs_data, &d_epoch_data_host, sizeof(epoch_data_str*)), "copying epoch data host pointer on device to epoch data device pointer on device returned error code %ce");
+	h_debug.print_if_cuda_error(cudaMemcpyToSymbol(d_gradients, &d_gradients_host, sizeof(gradient_str*)), "copying gradient host pointer on device to gradient device pointer on device returned error code %ce");
+
+	h_debug.print_timer_end("finished setting up device memory for gradients and epoch data");
 
 	//run epochs
-	if (debug_flag) {
-		stime_temp = std::chrono::high_resolution_clock::now();
-		printf("Debug~\tstarting training...\n");
-	}
+	h_debug.print_general("starting training...");
+	int runs = epochs / min_grid_size_feedforward;
+	h_debug.print_general("training %d runs for a total epoch count of %d", runs, min_grid_size_feedforward * runs);
 
-	bool debug_flag_internal = true;
-	int run = 1;
+	h_debug.print_if_cuda_error(cudaErrorLaunchOutOfResources, "this code has no percent ce in it");
+	h_debug.print_if_cuda_error(cudaErrorLaunchOutOfResources, "this code has has percent ce in it %ce and another format specifier %d", 10);
+	h_debug.print_if_cuda_error(cudaErrorLaunchOutOfResources, "%ce this code starts with percent ce");
+	h_debug.print_if_cuda_error(cudaErrorLaunchOutOfResources, "this code ends with percent ce %ce");
 
-	size_t block_epochs = max_epochs_sync / 1024;
-	if (epoch_runs != 0 && block_epochs * 1024 != max_epochs_sync) printf("\n\tWarning: Number of epochs running synchonously is not divisible by 1024\n\n");
 
-	if (epoch_runs != 0) {
-		printf("~%d\t%d\t%d\t%d\n", h_neurons_count * batch_size * block_epochs * 1024 * sizeof(double),
-			h_neurons_count_nol1 * block_epochs * 1024 * sizeof(double),
-			h_neurons_count_nol1 * batch_size * block_epochs * 1024 * sizeof(double),
-			h_layer_sizes[0] * batch_size * block_epochs * 1024 * sizeof(curandState));
-		//allocate device memory
-		if (debug_flag) {
-			stime_temp = std::chrono::high_resolution_clock::now();
-			printf("Debug~\tallocating epoch specific device memory for epoch number of %d...\n", block_epochs * 1024);
-		}
 
-		h_epochs_data->allocate_memory(h_neurons_count * batch_size * block_epochs * 1024 * sizeof(double),
-									   h_neurons_count_nol1 * block_epochs * 1024 * sizeof(double),
-									   h_neurons_count_nol1 * batch_size * block_epochs * 1024 * sizeof(double),
-									   h_layer_sizes[0] * batch_size * block_epochs * 1024 * sizeof(curandState));
-		cudaMemcpy(d_epochs_data_host, h_epochs_data, sizeof(epoch_data_str), cudaMemcpyHostToDevice);
-		cudaMemcpyToSymbol(d_epochs_data, &d_epochs_data_host, sizeof(epoch_data_str*));
 
-		if (debug_flag) {
-			std::cout << "Debug~\tfinished allocating epoch specific memory in " << std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - stime_temp).count() / 1000000000.0f << " seconds\n";
-		}
-	}
+	//auto stime_nano = std::chrono::high_resolution_clock::now();
+	//if (debug_flag) {
+	//	printf("Debug~\tinitalizing with:\tLayer Sizes: ");
+	//	for (int i = 0; i < h_network_size; i++) printf("%d ", h_layer_sizes[i]);
+	//	printf("\tBatch Size: %d\t\tEpochs: %d\n", batch_size, epochs);
+	//}
 
-	int thread_dim = 1024;
-	while (epoch_runs > 0) {
-		start_train:
-		//train
-		train_epoch << <block_epochs, thread_dim >> > (
-			batch_size,
-			momentum,
-			leaky_relu,
-			debug_flag_internal);
-		cudaError_t status = cudaDeviceSynchronize();
-		std::cout << cudaGetErrorString(status) << std::endl;
-		//sometimes cuda doesnt like running a lot of threads at once, esspecially with a low batch size, so we can reduce the threads per block to attempt to fix this
-		cudaError_t initalization_status = cudaGetLastError();
-		std::cout << cudaGetErrorString(initalization_status) << std::endl;
-		if (initalization_status == CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES) {
-			thread_dim /= 2;
-			block_epochs *= 2;
-			//reallocate memory just in case
-			h_epochs_data->free_memory();
-			cudaFree(d_epochs_data_host);
-			h_epochs_data->allocate_memory(h_neurons_count* batch_size* block_epochs * 1024 * sizeof(double),
-				h_neurons_count_nol1* block_epochs * 1024 * sizeof(double),
-				h_neurons_count_nol1* batch_size* block_epochs * 1024 * sizeof(double),
-				h_layer_sizes[0] * batch_size* block_epochs * 1024 * sizeof(curandState));
-			cudaMemcpy(d_epochs_data_host, h_epochs_data, sizeof(epoch_data_str), cudaMemcpyHostToDevice);
-			cudaMemcpyToSymbol(d_epochs_data, &d_epochs_data_host, sizeof(epoch_data_str*));
-			printf("\n\tWarning: Cuda initalization out of resources. Reducing threads to %d and increasing block to %d\n\n", thread_dim, block_epochs);
-			goto start_train;
-		}
-		else if (initalization_status != cudaSuccess) {
-			printf("\n\tError: Training batch %d failed to initalize with error code: %s\n\n", run, cudaGetErrorString(initalization_status));
-			h_epochs_data->free_memory();
-			h_gradients->free_memory();
-			free(h_epochs_data);
-			free(h_gradients);
-			cudaFree(d_gradients_host);
-			cudaFree(d_epochs_data_host);
-			return -1;
-		}
-		debug_flag_internal = false; //only run the debug code for the first epoch
-		epoch_runs -= 1;
-		if (status != cudaSuccess) {
-			printf("\n\tError: Training batch %d returned error code: %s\n\n", run, cudaGetErrorString(status));
-			h_epochs_data->free_memory();
-			h_gradients->free_memory();
-			free(h_gradients);
-			free(h_epochs_data);
-			cudaFree(d_gradients_host);
-			cudaFree(d_epochs_data_host);
-			return -1;
-		}
-		if (debug_flag) {
-			printf("Debug~\tFinishing calculating gradients for %d epochs\n", block_epochs * thread_dim * run);
-		}
-		run++;
-		if (epoch_runs == 0) {
-			h_epochs_data->free_memory();
-			cudaFree(d_epochs_data_host);
-		}
-	}
+	//auto stime_temp = std::chrono::high_resolution_clock::now();
+	//if (debug_flag) {
+	//	auto stime_temp = std::chrono::high_resolution_clock::now();
+	//	printf("Debug~\tcalculating free space...\n");
+	//}
 
-	//calculate how many epochs couldn't be run in max batches
-	int remaining_epochs = epochs - (block_epochs * 1024 * epoch_runs_debug);
-	printf("~%d\t%d\t%d~\n", epochs, block_epochs, epoch_runs_debug);
-	cudaError_t status;
-	int remaining_epochs_batch = remaining_epochs / 1024;
+	////get available device memory
+	//size_t free_mem, total_mem;
+	//cudaMemGetInfo(&free_mem, &total_mem);
+	//	//assume we can use ~50% of free memory
+	//size_t usable_memory = free_mem * 0.5f;
+	//	//calculate minimum memory needed outside of epochs
+	//size_t essential_mem = h_neurons_count * sizeof(double) * 3 + h_weights_count * sizeof(double); //gradients
+	//	//calculate memory needed per epoch
+	//printf("~%d\t%d\t%d\t%d\t%d\t%d~\n", h_neurons_count, batch_size, sizeof(double), sizeof(curandState), h_weights_count, h_neurons_count_nol1);
+	//size_t needed_mem_per_epoch = 0;
+	//needed_mem_per_epoch += h_neurons_count * batch_size * sizeof(double) * 1; //outputs
+	//needed_mem_per_epoch += h_neurons_count_nol1 * sizeof(double) * 2; //mean and variance
+	//needed_mem_per_epoch += h_neurons_count_nol1 * batch_size * sizeof(double) * 4; //x, x_norm, y, neuron_err
+	//needed_mem_per_epoch += h_layer_sizes[0] * batch_size * sizeof(curandState); //random number generator state
+	////get max amount of epochs
+	//size_t max_epochs_sync = ((usable_memory - essential_mem) / needed_mem_per_epoch);
+	//if (debug_flag) {
+	//	std::cout << "Debug~\tfinished calculating free space in " << std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - stime_temp).count() / 1000000000.0f << " seconds\n";
+	//	printf("\t\tTotal Space (bytes): %zu | Total Usable Space (bytes): %zu\n", total_mem, free_mem);
+	//	printf("\t\tMax memory able to be utilized by program (bytes): %zu\n", usable_memory);
+	//	printf("\t\tEssential Memory Needed (bytes): %zu | Memory Per Epoch Needed (bytes): %zu\n", essential_mem, needed_mem_per_epoch);
+	//	printf("\t\tMax Number of Epochs running synchronously: %lu\n", max_epochs_sync);
+	//}
 
-	printf("\n%d\n", remaining_epochs_batch * 1024);
+	////get largest layer size
+	//int h_largest_layer = h_layer_sizes[1];
+	//for (int i = 2; i < h_network_size; i++) if (h_layer_sizes[i] > h_largest_layer) h_largest_layer = h_layer_sizes[i];
+	////make sure we can run enough threads inside the training kernel
+	//cudaDeviceSetLimit(cudaLimitDevRuntimePendingLaunchCount, h_largest_layer * 1024 * max_epochs_sync);
 
-	if (remaining_epochs > 1024) { //epochs we can run in thread of 1024
-		//allocate memory
-		h_epochs_data->allocate_memory(h_neurons_count* batch_size* remaining_epochs_batch * 1024 * sizeof(double),
-			h_neurons_count_nol1* remaining_epochs_batch * 1024 * sizeof(double),
-			h_neurons_count_nol1* batch_size* remaining_epochs_batch * 1024 * sizeof(double),
-			h_layer_sizes[0] * batch_size* remaining_epochs_batch * 1024 * sizeof(curandState));
-		cudaMemcpy(d_epochs_data_host, h_epochs_data, sizeof(epoch_data_str), cudaMemcpyHostToDevice);
-		cudaMemcpyToSymbol(d_epochs_data, &d_epochs_data_host, sizeof(epoch_data_str*));
-		//train
-		train_epoch << <remaining_epochs_batch, 1024 >> > (
-			batch_size,
-			momentum,
-			leaky_relu,
-			debug_flag_internal);
-		//free epoch memory
-		h_epochs_data->free_memory();
-		cudaFree(d_epochs_data_host);
-		if (debug_flag) {
-			printf("Debug~\tFinishing calculating gradients for %d epochs\n", block_epochs * 1024 * (run - 1) + remaining_epochs_batch * 1024);
-		}
-		status = cudaDeviceSynchronize();
-		if (status != cudaSuccess) {
-			printf("\n\tError: Training batch %d returned error code: %s\n\n", run, cudaGetErrorString(status));
-			h_gradients->free_memory();
-			free(h_gradients);
-			free(h_epochs_data);
-			cudaFree(d_gradients_host);
-			return -1;
-		}
-	}
-	remaining_epochs -= (remaining_epochs / 1024) * 1024; //total number of epochs left should be below 1024
-	printf("\n%d\n", remaining_epochs);
-	if (remaining_epochs != 0) {
-		//allocate memory
-		h_epochs_data->allocate_memory(h_neurons_count* batch_size* remaining_epochs * sizeof(double),
-			h_neurons_count_nol1* remaining_epochs * sizeof(double),
-			h_neurons_count_nol1* batch_size* remaining_epochs * sizeof(double),
-			h_layer_sizes[0] * batch_size* remaining_epochs * sizeof(curandState));
-		status = cudaMemcpy(d_epochs_data_host, h_epochs_data, sizeof(epoch_data_str), cudaMemcpyHostToDevice);
-		std::cout << cudaGetErrorString(status) << std::endl;
-		status = cudaMemcpyToSymbol(d_epochs_data, &d_epochs_data_host, sizeof(epoch_data_str*));
-		std::cout << cudaGetErrorString(status) << std::endl;
-		std::cout << cudaGetErrorString(cudaDeviceSynchronize()) << std::endl;
-		//train
-		train_epoch << <1, remaining_epochs >> > (
-			batch_size,
-			momentum,
-			leaky_relu,
-			debug_flag_internal);
-		//free memory
-		status = cudaDeviceSynchronize();
-		h_epochs_data->free_memory();
-		cudaFree(d_epochs_data_host);
-		if (status != cudaSuccess) {
-			printf("\n\tError: Training batch %d returned error code: %s\n\n", run, cudaGetErrorString(status));
-			h_gradients->free_memory();
-			free(h_gradients);
-			free(h_epochs_data);
-			cudaFree(d_gradients_host);
-			return -1;
-		}
-	}
+	////create stucture for gradients/value storage
+	//if (debug_flag) {
+	//	stime_temp = std::chrono::high_resolution_clock::now();
+	//	printf("Debug~\tallocating necessary epoch memory on device...\n");
+	//}
 
-	if (debug_flag) {
-		printf("Debug~\tFinishing calculating gradients for %d epochs\n", block_epochs * 1024 * (run - 1) + remaining_epochs_batch * 1024 + remaining_epochs);
-	}
-	if (debug_flag) {
-		std::cout << "Debug~\tfinished calculating gradients with no errors in " << std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - stime_temp).count() / 1000000000.0f << " seconds\n";
-	}
+	//epoch_data_str* d_epochs_data_host;
+	//epoch_data_str* h_epochs_data;
+	//gradient_str* d_gradients_host;
+	//gradient_str* h_gradients;
 
-	if (debug_flag) {
-		stime_temp = std::chrono::high_resolution_clock::now();
-		printf("Debug~\tapplying gradients...\n");
-	}
-	int n_sum = 0, w_sum = 0;
-	for (int l = 1; l < h_network_size; l++) {
-		apply_gradients << <1, h_layer_sizes[l] >> > (n_sum, w_sum, l, eta);
-		n_sum += h_layer_sizes[l];
-		w_sum += h_layer_sizes[l];
-	}
-	h_gradients->free_memory();
-	free(h_gradients);
-	free(h_epochs_data);
-	cudaFree(d_gradients_host);
-	if (debug_flag) {
-		std::cout << "Debug~\tfinished applying gradients with error code: " << cudaGetErrorString(cudaDeviceSynchronize()) << " in " << std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - stime_temp).count() / 1000000000.0f << " seconds\n";
-	}
+	//cudaMalloc((void**)&d_epochs_data_host, sizeof(epoch_data_str));
+	//cudaMalloc((void**)&d_gradients_host, sizeof(gradient_str));
+	//h_epochs_data = (epoch_data_str*)malloc(sizeof(epoch_data_str));
+	//h_gradients = (gradient_str*)malloc(sizeof(gradient_str));
 
-	std::cout << "\n\t Total program time: " << std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - stime_nano).count() / 1000000000.0f << " seconds\n\n";
-	return 0;
+	//h_gradients->allocate_memory(h_neurons_count_nol1 * sizeof(double), h_weights_count * sizeof(double));
+	//cudaMemcpy(d_gradients_host, h_gradients, sizeof(gradient_str), cudaMemcpyHostToDevice);
+	//cudaMemcpyToSymbol(d_gradients, &d_gradients_host, sizeof(gradient_str*));
+
+	////calculate how many cycles we will need to run
+	//size_t epoch_runs = epochs / max_epochs_sync;
+	//size_t epoch_runs_debug = epoch_runs;
+	//if (epoch_runs == 0) printf("\n\tWarning: Epoch value of %d is less then the amount of epochs that can run synchonously (%d)\n\n", epochs, max_epochs_sync);
+	//if (epoch_runs != 0 && epoch_runs * max_epochs_sync != epochs) printf("\n\tWarning: Epoch value of %d is not a multiple of the amount of epochs that can run synchonously (%d)\n\n", epochs, max_epochs_sync);
+
+	////run epochs
+	//if (debug_flag) {
+	//	stime_temp = std::chrono::high_resolution_clock::now();
+	//	printf("Debug~\tstarting training...\n");
+	//}
+
+	//bool debug_flag_internal = true;
+	//int run = 1;
+
+	//size_t block_epochs = max_epochs_sync / 1024;
+	//if (epoch_runs != 0 && block_epochs * 1024 != max_epochs_sync) printf("\n\tWarning: Number of epochs running synchonously is not divisible by 1024\n\n");
+
+	//if (epoch_runs != 0) {
+	//	printf("~%d\t%d\t%d\t%d\n", h_neurons_count * batch_size * block_epochs * 1024 * sizeof(double),
+	//		h_neurons_count_nol1 * block_epochs * 1024 * sizeof(double),
+	//		h_neurons_count_nol1 * batch_size * block_epochs * 1024 * sizeof(double),
+	//		h_layer_sizes[0] * batch_size * block_epochs * 1024 * sizeof(curandState));
+	//	//allocate device memory
+	//	if (debug_flag) {
+	//		stime_temp = std::chrono::high_resolution_clock::now();
+	//		printf("Debug~\tallocating epoch specific device memory for epoch number of %d...\n", block_epochs * 1024);
+	//	}
+
+	//	h_epochs_data->allocate_memory(h_neurons_count * batch_size * block_epochs * 1024 * sizeof(double),
+	//								   h_neurons_count_nol1 * block_epochs * 1024 * sizeof(double),
+	//								   h_neurons_count_nol1 * batch_size * block_epochs * 1024 * sizeof(double),
+	//								   h_layer_sizes[0] * batch_size * block_epochs * 1024 * sizeof(curandState));
+	//	cudaMemcpy(d_epochs_data_host, h_epochs_data, sizeof(epoch_data_str), cudaMemcpyHostToDevice);
+	//	cudaMemcpyToSymbol(d_epochs_data, &d_epochs_data_host, sizeof(epoch_data_str*));
+
+	//	if (debug_flag) {
+	//		std::cout << "Debug~\tfinished allocating epoch specific memory in " << std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - stime_temp).count() / 1000000000.0f << " seconds\n";
+	//	}
+	//}
+
+	//int thread_dim = 1024;
+	//while (epoch_runs > 0) {
+	//	start_train:
+	//	//train
+	//	train_epoch << <block_epochs, thread_dim >> > (
+	//		batch_size,
+	//		momentum,
+	//		leaky_relu,
+	//		debug_flag_internal);
+	//	cudaError_t status = cudaDeviceSynchronize();
+	//	std::cout << cudaGetErrorString(status) << std::endl;
+	//	//sometimes cuda doesnt like running a lot of threads at once, esspecially with a low batch size, so we can reduce the threads per block to attempt to fix this
+	//	cudaError_t initalization_status = cudaGetLastError();
+	//	std::cout << cudaGetErrorString(initalization_status) << std::endl;
+	//	if (initalization_status == CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES) {
+	//		thread_dim /= 2;
+	//		block_epochs *= 2;
+	//		//reallocate memory just in case
+	//		h_epochs_data->free_memory();
+	//		cudaFree(d_epochs_data_host);
+	//		h_epochs_data->allocate_memory(h_neurons_count* batch_size* block_epochs * 1024 * sizeof(double),
+	//			h_neurons_count_nol1* block_epochs * 1024 * sizeof(double),
+	//			h_neurons_count_nol1* batch_size* block_epochs * 1024 * sizeof(double),
+	//			h_layer_sizes[0] * batch_size* block_epochs * 1024 * sizeof(curandState));
+	//		cudaMemcpy(d_epochs_data_host, h_epochs_data, sizeof(epoch_data_str), cudaMemcpyHostToDevice);
+	//		cudaMemcpyToSymbol(d_epochs_data, &d_epochs_data_host, sizeof(epoch_data_str*));
+	//		printf("\n\tWarning: Cuda initalization out of resources. Reducing threads to %d and increasing block to %d\n\n", thread_dim, block_epochs);
+	//		goto start_train;
+	//	}
+	//	else if (initalization_status != cudaSuccess) {
+	//		printf("\n\tError: Training batch %d failed to initalize with error code: %s\n\n", run, cudaGetErrorString(initalization_status));
+	//		h_epochs_data->free_memory();
+	//		h_gradients->free_memory();
+	//		free(h_epochs_data);
+	//		free(h_gradients);
+	//		cudaFree(d_gradients_host);
+	//		cudaFree(d_epochs_data_host);
+	//		return -1;
+	//	}
+	//	debug_flag_internal = false; //only run the debug code for the first epoch
+	//	epoch_runs -= 1;
+	//	if (status != cudaSuccess) {
+	//		printf("\n\tError: Training batch %d returned error code: %s\n\n", run, cudaGetErrorString(status));
+	//		h_epochs_data->free_memory();
+	//		h_gradients->free_memory();
+	//		free(h_gradients);
+	//		free(h_epochs_data);
+	//		cudaFree(d_gradients_host);
+	//		cudaFree(d_epochs_data_host);
+	//		return -1;
+	//	}
+	//	if (debug_flag) {
+	//		printf("Debug~\tFinishing calculating gradients for %d epochs\n", block_epochs * thread_dim * run);
+	//	}
+	//	run++;
+	//	if (epoch_runs == 0) {
+	//		h_epochs_data->free_memory();
+	//		cudaFree(d_epochs_data_host);
+	//	}
+	//}
+
+	////calculate how many epochs couldn't be run in max batches
+	//int remaining_epochs = epochs - (block_epochs * 1024 * epoch_runs_debug);
+	//printf("~%d\t%d\t%d~\n", epochs, block_epochs, epoch_runs_debug);
+	//cudaError_t status;
+	//int remaining_epochs_batch = remaining_epochs / 1024;
+
+	//printf("\n%d\n", remaining_epochs_batch * 1024);
+
+	//if (remaining_epochs > 1024) { //epochs we can run in thread of 1024
+	//	//allocate memory
+	//	h_epochs_data->allocate_memory(h_neurons_count* batch_size* remaining_epochs_batch * 1024 * sizeof(double),
+	//		h_neurons_count_nol1* remaining_epochs_batch * 1024 * sizeof(double),
+	//		h_neurons_count_nol1* batch_size* remaining_epochs_batch * 1024 * sizeof(double),
+	//		h_layer_sizes[0] * batch_size* remaining_epochs_batch * 1024 * sizeof(curandState));
+	//	cudaMemcpy(d_epochs_data_host, h_epochs_data, sizeof(epoch_data_str), cudaMemcpyHostToDevice);
+	//	cudaMemcpyToSymbol(d_epochs_data, &d_epochs_data_host, sizeof(epoch_data_str*));
+	//	//train
+	//	train_epoch << <remaining_epochs_batch, 1024 >> > (
+	//		batch_size,
+	//		momentum,
+	//		leaky_relu,
+	//		debug_flag_internal);
+	//	//free epoch memory
+	//	h_epochs_data->free_memory();
+	//	cudaFree(d_epochs_data_host);
+	//	if (debug_flag) {
+	//		printf("Debug~\tFinishing calculating gradients for %d epochs\n", block_epochs * 1024 * (run - 1) + remaining_epochs_batch * 1024);
+	//	}
+	//	status = cudaDeviceSynchronize();
+	//	if (status != cudaSuccess) {
+	//		printf("\n\tError: Training batch %d returned error code: %s\n\n", run, cudaGetErrorString(status));
+	//		h_gradients->free_memory();
+	//		free(h_gradients);
+	//		free(h_epochs_data);
+	//		cudaFree(d_gradients_host);
+	//		return -1;
+	//	}
+	//}
+	//remaining_epochs -= (remaining_epochs / 1024) * 1024; //total number of epochs left should be below 1024
+	//printf("\n%d\n", remaining_epochs);
+	//if (remaining_epochs != 0) {
+	//	//allocate memory
+	//	h_epochs_data->allocate_memory(h_neurons_count* batch_size* remaining_epochs * sizeof(double),
+	//		h_neurons_count_nol1* remaining_epochs * sizeof(double),
+	//		h_neurons_count_nol1* batch_size* remaining_epochs * sizeof(double),
+	//		h_layer_sizes[0] * batch_size* remaining_epochs * sizeof(curandState));
+	//	status = cudaMemcpy(d_epochs_data_host, h_epochs_data, sizeof(epoch_data_str), cudaMemcpyHostToDevice);
+	//	std::cout << cudaGetErrorString(status) << std::endl;
+	//	status = cudaMemcpyToSymbol(d_epochs_data, &d_epochs_data_host, sizeof(epoch_data_str*));
+	//	std::cout << cudaGetErrorString(status) << std::endl;
+	//	std::cout << cudaGetErrorString(cudaDeviceSynchronize()) << std::endl;
+	//	//train
+	//	train_epoch << <1, remaining_epochs >> > (
+	//		batch_size,
+	//		momentum,
+	//		leaky_relu,
+	//		debug_flag_internal);
+	//	//free memory
+	//	status = cudaDeviceSynchronize();
+	//	h_epochs_data->free_memory();
+	//	cudaFree(d_epochs_data_host);
+	//	if (status != cudaSuccess) {
+	//		printf("\n\tError: Training batch %d returned error code: %s\n\n", run, cudaGetErrorString(status));
+	//		h_gradients->free_memory();
+	//		free(h_gradients);
+	//		free(h_epochs_data);
+	//		cudaFree(d_gradients_host);
+	//		return -1;
+	//	}
+	//}
+
+	//if (debug_flag) {
+	//	printf("Debug~\tFinishing calculating gradients for %d epochs\n", block_epochs * 1024 * (run - 1) + remaining_epochs_batch * 1024 + remaining_epochs);
+	//}
+	//if (debug_flag) {
+	//	std::cout << "Debug~\tfinished calculating gradients with no errors in " << std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - stime_temp).count() / 1000000000.0f << " seconds\n";
+	//}
+
+	//if (debug_flag) {
+	//	stime_temp = std::chrono::high_resolution_clock::now();
+	//	printf("Debug~\tapplying gradients...\n");
+	//}
+	//int n_sum = 0, w_sum = 0;
+	//for (int l = 1; l < h_network_size; l++) {
+	//	apply_gradients << <1, h_layer_sizes[l] >> > (n_sum, w_sum, l, eta);
+	//	n_sum += h_layer_sizes[l];
+	//	w_sum += h_layer_sizes[l];
+	//}
+	//h_gradients->free_memory();
+	//free(h_gradients);
+	//free(h_epochs_data);
+	//cudaFree(d_gradients_host);
+	//if (debug_flag) {
+	//	std::cout << "Debug~\tfinished applying gradients with error code: " << cudaGetErrorString(cudaDeviceSynchronize()) << " in " << std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - stime_temp).count() / 1000000000.0f << " seconds\n";
+	//}
+
+	//std::cout << "\n\t Total program time: " << std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - stime_nano).count() / 1000000000.0f << " seconds\n\n";
+	//return 0;
+return 0;
 }
 
 Network::~Network() {
@@ -680,6 +841,8 @@ Network::~Network() {
 	cudaFree(d_running_variance_host);
 	cudaFree(d_weights_host);
 	cudaFree(d_layer_sizes_host);
+	cudaFree(d_epochs_data);
+	cudaFree(d_gradients);
 }
 
 

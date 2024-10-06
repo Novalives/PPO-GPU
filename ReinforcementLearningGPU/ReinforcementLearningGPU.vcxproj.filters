@@ -4,9 +4,6 @@
     <CudaCompile Include="Network.cu">
       <Filter>Network\Source</Filter>
     </CudaCompile>
-    <CudaCompile Include="kernel.cu">
-      <Filter>Network\Source</Filter>
-    </CudaCompile>
   </ItemGroup>
   <ItemGroup>
     <Filter Include="Network">
@@ -23,5 +20,10 @@
     <ClInclude Include="Network.h">
       <Filter>Network\Header</Filter>
     </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="main.cpp">
+      <Filter>Network\Source</Filter>
+    </ClCompile>
   </ItemGroup>
 </Project>
